@@ -16,6 +16,7 @@
 #include <torch/csrc/jit/passes/constant_propagation.h>
 #include <torch/csrc/jit/passes/create_autodiff_subgraphs.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
+#include <torch/csrc/jit/passes/decompose_ops.h>
 #include <torch/csrc/jit/passes/graph_fuser.h>
 #include <torch/csrc/jit/passes/inline_autodiff_subgraphs.h>
 #include <torch/csrc/jit/passes/inplace_check.h>
@@ -605,6 +606,7 @@ struct GraphExecutorImpl {
       for (Node* dnode : diff_nodes) {
         auto diff_graph = std::move(dnode->g(attr::Subgraph));
         Gradient gradient = differentiate(diff_graph);
+        runPostdiffOptimization(gradient.f);
         runNondiffOptimization(gradient.f);
         packGradient(gradient, dnode);
       }
@@ -638,11 +640,26 @@ struct GraphExecutorImpl {
     CheckInplace(graph);
   }
 
+  void runPostdiffOptimization(std::shared_ptr<Graph>& graph){
+    // Run post differentiation optimization passes, Autodiff will replace some parts of graph with new graph 
+    // these new graphs usually consists of control flow and miss shape information on nodes, so we run shape
+    // prop and constant prop, as well as loop unrolling in some cases
+    PropagateInputShapes(graph);
+    ConstantPropagation(graph);
+
+    // Unroll small loops, and eliminate expressions that are the same at every
+    // iteration.
+    UnrollLoops(graph);
+  }
+
   void runNondiffOptimization(std::shared_ptr<Graph>& graph) {
     // run custom passes that different backends can register
     for (const auto& pass : getCustomPasses()) {
       pass(graph);
     }
+    // decomposition pass, decompose certain ops that will be used in the following
+    // passes (like batchmm and jit fusion)
+    DecomposeOps(graph);
     // Rewrite subgraphs with many MMs into expressions that batch them.
     BatchMM(graph);
 
